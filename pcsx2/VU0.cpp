@@ -74,7 +74,23 @@ __fi void _vu0run(bool breakOnMbit, bool addCycles, bool sync_only) {
 	// Add cycles if called from EE's COP2
 	if (addCycles)
 	{
-		cpuRegs.cycle += (VU0.cycle - startcycle);
+		// The EE clock is monotonic — never rewind it. Under the ARM64 macro-mode COP2
+		// recompiler, a launched VU0 program can be deferred while cpuRegs.cycle races far
+		// ahead; when it is finally finished here, (VU0.cycle - startcycle) is hugely
+		// NEGATIVE and an unconditional `cpuRegs.cycle +=` slams the EE clock backward by
+		// billions of cycles. Two observed failure modes:
+		//   * the EE event scheduler never reaches the next VBlank, so the guest deadlocks in
+		//     the kernel idle loop with VBlank pending-but-undelivered (Ratchet: Deadlocked
+		//     SCUS-97465 image-freeze under FullVU0SyncHack);
+		//   * guest code that times itself with `elapsed = now - start` gets a NEGATIVE
+		//     elapsed and feeds it to an unsigned divide-by-repeated-subtraction, which then
+		//     needs ~1e14 iterations (ESPN NFL 2K5 SLUS-20919 hangs at the first screen with
+		//     the EE spinning at 0x0041c678 and a1 = 0xffffffffffffca95 = -13675).
+		// Only ever advance. Ported from the pre-mono tree, where it shipped and was then
+		// lost in the migration.
+		const s64 vu0delta = static_cast<s64>(VU0.cycle - startcycle);
+		if (vu0delta > 0)
+			cpuRegs.cycle += static_cast<u64>(vu0delta);
 		CpuVU1->ExecuteBlock(0); // Catch up VU1 as it's likely fallen behind
 
 		if(VU0.VI[REG_VPU_STAT].UL & 1)

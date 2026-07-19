@@ -29,11 +29,6 @@
 #include "common/FastJmp.h"
 #include "common/Pcsx2Defs.h"
 
-#if defined(__APPLE__)
-#include "common/Darwin/DarwinMisc.h"
-#include <TargetConditionals.h>
-#endif
-
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -186,15 +181,7 @@ static const void* DispatchPageReset = nullptr;    // counted manual block -> re
 //    fallback); eePatchWaitingPredecessors wires it when the target compiles.
 //
 // Flip s_eeBlockLinkEnabled to false to fall back to pure LUT dispatch.
-// Disabled on iOS: the direct-B patching system is a new code path that the
-// proven fork doesn't use, and it has been linked to crashes on iOS devices
-// (corrupted branch targets, JIT code region writes). The LUT-indirect path
-// is slightly slower but stable.
-#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
-static bool s_eeBlockLinkEnabled = false;
-#else
 static bool s_eeBlockLinkEnabled = true;
-#endif
 
 struct EEBlockLinkExit
 {
@@ -639,6 +626,7 @@ enum : u32
 // Defined below (block-compile helpers) — used by recTranslateOp's COP2 inline path.
 static void recEmitInterpInline(u32 op);
 static bool recTranslateOp(u32 op, u32 pc);
+static bool recCop2ForceInterp(u32 op); // FullVU0SyncHack → COP2 macro-ALU on the inline interp
 
 // LDL/LDR (and SDL/SDR) pair fusion (yaps2 1d6f80984a/5f44e772d0). The game emits an
 // unaligned 64-bit access as an LDL/LDR (or SDL/SDR) pair on the same Rt/Rs whose
@@ -2079,12 +2067,6 @@ static bool recTryTranslateCachedOp(u32 op, RecGprCacheState& cache, const RecGp
 		{
 			if (rd == 0)
 				return true;
-			if (rt == 0)
-			{
-				const a64::Register& dst = recCacheDest(cache, rd);
-				armAsm->Mov(dst, 0);
-				return true;
-			}
 			const a64::Register& src = recCacheLoad(cache, rt);
 			const a64::Register& dst = recCacheDest(cache, rd, rt);
 			if (funct == 0x00)
@@ -2103,21 +2085,6 @@ static bool recTryTranslateCachedOp(u32 op, RecGprCacheState& cache, const RecGp
 		{
 			if (rd == 0)
 				return true;
-			if (rt == 0)
-			{
-				const a64::Register& dst = recCacheDest(cache, rd);
-				armAsm->Mov(dst, 0);
-				return true;
-			}
-			if (rs == 0)
-			{
-				// Shift by zero is a sign-extending move.
-				const a64::Register& src = recCacheLoad(cache, rt);
-				const a64::Register& dst = recCacheDest(cache, rd, rt);
-				move_w(dst.W(), src.W());
-				armAsm->Sxtw(dst, dst.W());
-				return true;
-			}
 			const a64::Register& src = recCacheLoad(cache, rt);
 			const a64::Register& sh = recCacheLoad(cache, rs);
 			const a64::Register& dst = recCacheDest(cache, rd, rt, rs);
@@ -2137,20 +2104,6 @@ static bool recTryTranslateCachedOp(u32 op, RecGprCacheState& cache, const RecGp
 		{
 			if (rd == 0)
 				return true;
-			if (rt == 0)
-			{
-				const a64::Register& dst = recCacheDest(cache, rd);
-				armAsm->Mov(dst, 0);
-				return true;
-			}
-			if (rs == 0)
-			{
-				// Shift by zero is a plain move.
-				const a64::Register& src = recCacheLoad(cache, rt);
-				const a64::Register& dst = recCacheDest(cache, rd, rt);
-				move_x(dst, src);
-				return true;
-			}
 			const a64::Register& src = recCacheLoad(cache, rt);
 			const a64::Register& sh = recCacheLoad(cache, rs);
 			const a64::Register& dst = recCacheDest(cache, rd, rt, rs);
@@ -2878,6 +2831,15 @@ static bool recTranslateOp(u32 op, u32 pc)
 		// recEmitBranch/armEmitBranchLikelyTest, Phase M4), which ends the block at them — so
 		// they never reach here as a straight-line op (the case below is a defensive fallback).
 		case 0x12:
+			// FullVU0SyncHack: hand the offending macro-ALU ops to the inline interpreter
+			// before the native dispatch below ever sees them (see recCop2ForceInterp). The
+			// predicate already excludes the transfers and the BC2 branches.
+			if (recCop2ForceInterp(op))
+			{
+				cpuRegs.code = op;
+				recEmitInterpInline(op);
+				return true;
+			}
 			switch (rs)
 			{
 				case 0x01: // QMFC2 (M3.3) — native, memory-backed
@@ -3695,8 +3657,48 @@ static bool recEmitTrapCompareIfTrap(u32 op, a64::Label* skip)
 // op actually syncs VU0. (The cycles must NOT be committed before a FINISH: _vu0FinishMicro
 // overwrites cpuRegs.cycle with VU0.cycle (VU0.cpp), so a pre-commit would be lost; x86 keeps
 // the uncommitted cycles in s_nBlockCycles so they ride past the finish.) See recRecompile.
+// Under FullVU0SyncHack, route the COP2 macro-ALU SPECIAL2 ops to the inline interpreter.
+//
+// The native macro-mode COP2 path lets the EE and VU0 clocks drift; the eventual
+// `cpuRegs.cycle += VU0.cycle - startcycle` reconciliation in _vu0run then slams the EE clock
+// BACKWARD and the event scheduler wedges (Ratchet: Deadlocked SCUS-97465 — image freezes with
+// audio still running). The interpreter never drifts, because it fully syncs
+// (vu0Sync/_vu0FinishMicro) on EVERY COP2 op. Routing the offending ops through it sidesteps
+// the drift entirely, and since only a handful of VU0 ops per frame are involved the EE
+// recompiler still runs all the surrounding code — far cheaper than the EE interpreter.
+//
+// The split below is the one that shipped in the pre-mono tree (kMode 12 of a long bisect):
+// every COP2 SPECIAL2 op goes to the interpreter EXCEPT the accumulator family, which stays
+// native. Transfers (QMFC2/CFC2/QMTC2/CTC2), SPECIAL1, LQC2/SQC2 and the BC2 branches all stay
+// native. Getting only PART of this is what leaves the model stuck facing one direction: the
+// handshake recovers (no freeze) but stale VF data still reaches the transform.
+//
+// The original carried a 16-mode bisect scaffold used to find this split; that was development
+// tooling and is deliberately not ported — only the conclusion is.
+static bool recCop2ForceInterp(u32 op)
+{
+	if (!EmuConfig.Gamefixes.FullVU0SyncHack)
+		return false;
+	if ((op >> 26) != 0x12)
+		return false; // not COP2
+	const u32 rs = (op >> 21) & 0x1f;
+	// rs < 0x10 covers the transfers and the BC2 branches; funct < 0x3c is SPECIAL1.
+	if (rs < 0x10 || (op & 0x3f) < 0x3c)
+		return false;
+	// SPECIAL2 sub-op index, decoded the way microVU_Macro does it.
+	const u32 idx = (op & 3) | ((op >> 4) & 0x7c);
+	const bool acc = idx <= 0x0f || (idx >= 0x18 && idx <= 0x1c) || idx == 0x1e ||
+	                 (idx >= 0x20 && idx <= 0x2e && idx != 0x2b);
+	return !acc; // everything but the ACC family goes to the interpreter
+}
+
 static bool recOpNeedsCycleFlush(u32 op)
 {
+	// Force-interp COP2 ops run the interpreter inline (like CALLMS) and need a LIVE clock —
+	// without the flush they interpret against a stale cpuRegs.cycle, so the interpreter's own
+	// vu0Sync only partially catches VU0 up and VF reads come back stale.
+	if (recCop2ForceInterp(op))
+		return true;
 	if ((op >> 26) == 0x12)
 	{
 		if (((op >> 21) & 0x1f) == 0x08)
@@ -3748,6 +3750,7 @@ static bool recCop2IsCallms(u32 op)
 //     compile-time bool baked into arg2 just like x86.
 
 extern void _vu0WaitMicro();
+extern void vu0Sync(); // VU0.cpp — catch VU0 up to the EE clock (no force-finish)
 
 // Per-block "this block contains an interlocked (cpuRegs.code & 1) COP2 op" flag — x86's
 // s_nBlockInterlocked. Set by COP2_Interlock, baked into the ExecuteBlockJIT `interlocked`
@@ -3810,6 +3813,24 @@ static void mVUSyncVU0(u32 raw)
 // either run-to-catch-up + _vu0WaitMicro (M-bit sync) or _vu0FinishMicro.
 static void COP2_Interlock(bool mBitSync, u32 raw)
 {
+	// The interpreter does vu0Sync() at the TOP of every COP2 transfer op (VU0.cpp
+	// QMFC2/CFC2/QMTC2/CTC2) — with a LIVE cpuRegs.cycle — catching VU0 up to the EE clock
+	// BEFORE any force-finish. The native path skipped this, so its force-finish ran VU0 from a
+	// stale, far-behind position and broke the VU0 handshake (Ratchet: Deadlocked freeze on
+	// entering a level). Committing the block's cycles FIRST is what lets vu0Sync see the live
+	// clock and fully sync — committing after only PARTIALLY catches VU0 up, which returns stale
+	// VF data (missing player model / stuck facing one direction).
+	//
+	// This is now the SOLE cycle commit for transfer ops: the four handlers that route through
+	// here (recCFC2/recCTC2/recQMFC2/recQMTC2) pass 0 to their downstream mVUSyncVU0 so the
+	// cycles aren't committed twice. recLQC2/recSQC2 don't come through here and still pass
+	// s_cop2RawCycles themselves.
+	//
+	// Ported from the pre-mono tree, where it shipped as the Ratchet fix and was then lost in
+	// the migration — which is why the freeze came back.
+	recEmitCommitBlockCycles(raw);
+	armEmitCall(reinterpret_cast<const void*>(::vu0Sync)); // reads AND writes (freeze lives on writes)
+
 	if (!(cpuRegs.code & 1))
 		return;
 
@@ -3821,12 +3842,7 @@ static void COP2_Interlock(bool mBitSync, u32 raw)
 
 	const a64::Register rax = RXVIXLSCRATCH; // x16
 
-	armAsm->Ldr(rax, a64::MemOperand(RESTATEPTR, EE_CYCLE_OFFSET));
-	if (raw != 0)
-	{
-		armAsm->Add(rax, rax, recScaleBlockCycles(raw));
-		armAsm->Str(rax, a64::MemOperand(RESTATEPTR, EE_CYCLE_OFFSET));
-	}
+	armAsm->Ldr(rax, a64::MemOperand(RESTATEPTR, EE_CYCLE_OFFSET)); // already committed above
 
 	armMoveAddressToReg(RSCRATCHADDR, &VU0.VI[REG_VPU_STAT].UL);
 	armAsm->Ldr(RWARG3, a64::MemOperand(RSCRATCHADDR));
@@ -3899,7 +3915,7 @@ static void recCFC2()
 	if (!(cpuRegs.code & 1))
 	{
 		if (g_pCurInstInfo->info & EEINST_COP2_SYNC_VU0)
-			mVUSyncVU0(s_cop2RawCycles);
+			mVUSyncVU0(0); // cycles already committed in COP2_Interlock — no double-commit
 		else if (g_pCurInstInfo->info & EEINST_COP2_FINISH_VU0)
 			mVUFinishVU0();
 	}
@@ -3960,7 +3976,7 @@ static void recCTC2()
 	if (!(cpuRegs.code & 1))
 	{
 		if (g_pCurInstInfo->info & EEINST_COP2_SYNC_VU0)
-			mVUSyncVU0(s_cop2RawCycles);
+			mVUSyncVU0(0); // cycles already committed in COP2_Interlock — no double-commit
 		else if (g_pCurInstInfo->info & EEINST_COP2_FINISH_VU0)
 			mVUFinishVU0();
 	}
@@ -4094,7 +4110,7 @@ static void recQMFC2()
 	if (!(cpuRegs.code & 1))
 	{
 		if (g_pCurInstInfo->info & EEINST_COP2_SYNC_VU0)
-			mVUSyncVU0(s_cop2RawCycles);
+			mVUSyncVU0(0); // cycles already committed in COP2_Interlock — no double-commit
 		else if (g_pCurInstInfo->info & EEINST_COP2_FINISH_VU0)
 			mVUFinishVU0();
 	}
@@ -4116,7 +4132,7 @@ static void recQMTC2()
 	if (!(cpuRegs.code & 1))
 	{
 		if (g_pCurInstInfo->info & EEINST_COP2_SYNC_VU0)
-			mVUSyncVU0(s_cop2RawCycles);
+			mVUSyncVU0(0); // cycles already committed in COP2_Interlock — no double-commit
 		else if (g_pCurInstInfo->info & EEINST_COP2_FINISH_VU0)
 			mVUFinishVU0();
 	}
@@ -5006,7 +5022,10 @@ static void recRecompile(u32 startpc)
 		{
 			raw_cycles += eeOpCycles(op);
 			s_cop2RawCycles = raw_cycles;
-			if (recCop2IsCallms(op))
+			// Force-interp COP2 ops need the same live-clock commit CALLMS does: the inline
+			// interpreter syncs VU0 against cpuRegs.cycle, so the block's cycles must land
+			// before it runs, not after.
+			if (recCop2IsCallms(op) || recCop2ForceInterp(op))
 			{
 				// CALLMS/CALLMSR are x86's only INTERPRETATE_COP2_FUNC ops: they commit the
 				// scaled block cycles to cpuRegs.cycle and clear the accumulator
@@ -5108,9 +5127,87 @@ static void recRecompile(u32 startpc)
 		recRegisterBlockLinks(startpc, block_entry);
 }
 
+
+// Interpreter-granularity delivery of interrupts raised INSIDE an event test.
+//
+// _cpuEventTest_Shared deliberately does not deliver an INTC/DMAC exception raised by its
+// own sub-updates (rcntUpdate etc.); delivery is postponed to the NEXT event test so the
+// guest can run briefly between raise and delivery (Grandia II PAL spins on INTC_STAT's
+// vsync bit and must read it before the handler clears it). On the interpreter "briefly"
+// is 1-2 instructions: cpuTestINTCInts pulls nextEventCycle to cycle+4 and the dispatch
+// loop re-checks per instruction. Under the block recompiler the next check is the next
+// BLOCK TAIL, so the entire next block runs first.
+//
+// ESPN NFL 2K5 (SLUS-20919) is the proven casualty: its clock is (soft_high<<16)|T0_COUNT
+// with the high half carried by the T0-overflow ISR. Its reader (0x101610) double-samples
+// the high half and triple-reads COUNT precisely to detect a wrap racing the ISR — but
+// inside one recompiled block every rcntRcount() returns the identical frozen value
+// (cpuRegs.cycle only moves at block boundaries) and no exception can land mid-block, so
+// every guard is structurally blind. When a wrap fell in the [reader-block-start .. first
+// load] window, the reader composed old_high|wrapped_low, time stepped back ~65k ticks,
+// and the game's unsigned divide-by-repeated-subtraction span forever (first-screen
+// freeze, VU 0%, EE pinned at 0x0041c678; works on the interpreter).
+//
+// Fix: when the event test returns with a deliverable exception pending, single-step the
+// interpreter (the same intExecuteOneInst the fallback blocks use) until the +4 deadline
+// passes, then deliver — reproducing the interpreter's raise-to-delivery distance, which
+// is the reference behaviour for every game that works there. Control-flow instructions
+// are not stepped; delivery happens before them (EPC = the branch, an ordinary exception
+// case) since branch single-stepping in rec state is unproven. Cost: a handful of interp
+// steps only on event tests that raised a deliverable exception (a few hundred/second).
+static constexpr bool s_eePromptIrqDelivery = true;
+
+// Mirrors the delivery head of _cpuEventTest_Shared exactly (cpuIntsEnabled is static in
+// R5900.cpp): returns the exception mask to deliver, or 0 when nothing is deliverable.
+static __fi uint recDeliverableIrqMask()
+{
+	const uint mask = intcInterrupt() | dmacInterrupt();
+	if (mask == 0)
+		return 0;
+	if (!(cpuRegs.CP0.n.Status.val & mask) || !cpuRegs.CP0.n.Status.b.EIE ||
+		!cpuRegs.CP0.n.Status.b.IE || cpuRegs.CP0.n.Status.b.EXL ||
+		(cpuRegs.CP0.n.Status.b.ERL != 0))
+		return 0;
+	return mask;
+}
+
+static bool recIsControlFlowOp(u32 op)
+{
+	const u32 hi = op >> 26;
+	if (hi == 0x00)
+	{
+		const u32 funct = op & 0x3f;
+		return funct == 0x08 || funct == 0x09 || funct == 0x0c || funct == 0x0d; // JR/JALR/SYSCALL/BREAK
+	}
+	return hi == 0x01                  // REGIMM branch family
+		|| (hi >= 0x02 && hi <= 0x07)  // J/JAL/BEQ/BNE/BLEZ/BGTZ
+		|| (hi >= 0x14 && hi <= 0x17)  // BEQL/BNEL/BLEZL/BGTZL
+		|| hi == 0x10 || hi == 0x11 || hi == 0x12; // COP0/1/2 (bc branches, ERET, EI/DI)
+}
+
 static void recEventTest()
 {
 	_cpuEventTest_Shared();
+
+	if (s_eePromptIrqDelivery && !eeRecExitRequested &&
+		VMManager::GetState() == VMState::Running && recDeliverableIrqMask() != 0)
+	{
+		for (int steps = 0; steps < 8; steps++)
+		{
+			const bool deadline = (s64)(cpuRegs.cycle - cpuRegs.nextEventCycle) >= 0;
+			if (deadline || recIsControlFlowOp(memRead32(cpuRegs.pc)))
+			{
+				// Re-probe: a stepped DI/MTC0 may have masked the source meanwhile.
+				const uint mask = recDeliverableIrqMask();
+				if (mask != 0)
+					cpuException(mask, cpuRegs.branch);
+				break;
+			}
+			intExecuteOneInst();
+			if (eeRecExitRequested)
+				break;
+		}
+	}
 
 	if (eeRecExitRequested)
 	{
@@ -5127,13 +5224,6 @@ static void recExecute()
 {
 	if (eeRecNeedsReset || !EnterRecompiledCode)
 		recResetRaw();
-
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-	// [iOS] Ensure the JIT region is executable (and writable for code emission) before
-	// dispatching. On iOS the MAP_JIT dual-map can be revoked by the OS between boots;
-	// LegacyEnsureExecutable re-arms pthread_jit_write_protect_np / the W^X aliases.
-	DarwinMisc::LegacyEnsureExecutable();
-#endif
 
 	if (fastjmp_set(&s_jmp_buf) != 0)
 	{
