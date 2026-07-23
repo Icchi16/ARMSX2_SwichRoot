@@ -1,4 +1,4 @@
-name: Build ARMSX2 for Switchroot Tegra X1 v3
+name: Build ARMSX2 for Switchroot Tegra X1 v4
 
 on:
   workflow_dispatch:
@@ -102,36 +102,66 @@ jobs:
             exit 1
           fi
 
-      - name: Patch AppImage packaging to mirror the working fork
+      - name: Ensure AppImage bundles FreeType and HarfBuzz
         run: |
           set -euxo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path(".github/workflows/scripts/linux/appimage-qt.sh")
           text = path.read_text()
-          old = 'declare -a MANUAL_LIBS=( "libshaderc_shared.so.1" )'
-          new = ('declare -a MANUAL_LIBS=( "libshaderc_shared.so.1" '
-                 '"libharfbuzz.so.0" "libfreetype.so.6" )')
+          required = [
+              "libshaderc_shared.so.1",
+              "libharfbuzz.so.0",
+              "libfreetype.so.6",
+          ]
 
-          count = text.count(old)
-          if count != 1:
+          # Accept declarations with or without `declare -a`, arbitrary spacing,
+          # and arrays split across multiple lines. This also succeeds when the
+          # required libraries were already committed to the fork.
+          pattern = re.compile(
+              r"(?ms)^(?P<indent>[ \t]*)(?:declare[ \t]+-a[ \t]+)?"
+              r"MANUAL_LIBS[ \t]*=[ \t]*\((?P<body>.*?)\)"
+          )
+          match = pattern.search(text)
+          if not match:
+              nearby = "\n".join(
+                  line for line in text.splitlines()
+                  if "MANUAL_LIBS" in line or "shaderc" in line
+              )
               raise SystemExit(
-                  f"Expected the official MANUAL_LIBS line once, found {count}. "
-                  "Inspect appimage-qt.sh because upstream changed it."
+                  "Could not locate the MANUAL_LIBS array in appimage-qt.sh. "
+                  f"Relevant lines:\n{nearby or '(none)'}"
               )
 
-          path.write_text(text.replace(old, new))
+          body = match.group("body")
+          libs = re.findall(r"['\"]([^'\"]+)['\"]", body)
+          for lib in required:
+              if lib not in libs:
+                  libs.append(lib)
+
+          replacement = (
+              f'{match.group("indent")}declare -a MANUAL_LIBS=( '
+              + " ".join(f'"{lib}"' for lib in libs)
+              + " )"
+          )
+          text = text[:match.start()] + replacement + text[match.end():]
+          path.write_text(text)
           PY
 
-          grep -n 'MANUAL_LIBS' .github/workflows/scripts/linux/appimage-qt.sh
+          grep -n -A2 -B2 'MANUAL_LIBS' \
+            .github/workflows/scripts/linux/appimage-qt.sh
+          grep -q 'libshaderc_shared.so.1' .github/workflows/scripts/linux/appimage-qt.sh
+          grep -q 'libharfbuzz.so.0' .github/workflows/scripts/linux/appimage-qt.sh
+          grep -q 'libfreetype.so.6' .github/workflows/scripts/linux/appimage-qt.sh
 
       - name: Cache bundled dependencies
         id: cache-deps
         uses: actions/cache@v4
         with:
           path: .deps
-          key: switchroot-jammy-arm64-freetype-2.14.3-v3-${{ hashFiles('.github/workflows/scripts/linux/build-dependencies-qt.sh', '.github/workflows/scripts/common/*.patch') }}
+          key: switchroot-jammy-arm64-freetype-2.14.3-v4-${{ hashFiles('.github/workflows/scripts/linux/build-dependencies-qt.sh', '.github/workflows/scripts/common/*.patch') }}
 
       - name: Build modern FreeType on the Jammy baseline
         if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -327,7 +357,7 @@ jobs:
       - name: Upload AppImage and build information
         uses: actions/upload-artifact@v4
         with:
-          name: ARMSX2-switchroot-tegra-x1-arm64-v3
+          name: ARMSX2-switchroot-tegra-x1-arm64-v4
           path: |
             ARMSX2-switchroot-tegra-x1-arm64.AppImage
             build-info.txt
