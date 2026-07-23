@@ -1,0 +1,10 @@
+diff --git a/cmake/BuildParameters.cmake b/cmake/BuildParameters.cmake
+--- a/cmake/BuildParameters.cmake
++++ b/cmake/BuildParameters.cmake
+@@
+-    # Require atomic rmw instructions. MSVC (and clang-cl) reject -march;
+-    # their arm64 baseline already includes what we need.
+-    add_compile_options("-march=armv8.1-a")
++    # Nintendo Switch/Tegra X1 uses Cortex-A57 (ARMv8.0-A), without ARMv8.1 LSE.
++    # Use LL/SC atomics and tune for Cortex-A57 instead of emitting LSE instructions.
++    add_compile_options("-march=armv8-a" "-mtune=cortex-a57" "-mno-outline-atomics")

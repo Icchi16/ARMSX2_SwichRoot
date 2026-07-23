@@ -1,0 +1,174 @@
+name: Build ARMSX2 for Switchroot Tegra X1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - switchroot-build
+
+permissions:
+  contents: read
+
+jobs:
+  build-switchroot:
+    name: Switchroot / Cortex-A57 / ARMv8.0 / 4K
+    runs-on: ubuntu-24.04-arm
+
+    # Build against Ubuntu 22.04 userspace for broader glibc compatibility.
+    container:
+      image: ubuntu:22.04
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      DEPS_DIR: ${{ github.workspace }}/.deps/qt
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: "true"
+      CCACHE_COMPRESSLEVEL: "9"
+      CCACHE_MAXSIZE: 500M
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Bootstrap Ubuntu 22.04 ARM64 container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl wget gnupg software-properties-common sudo
+
+          add-apt-repository -y universe
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            > /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main' \
+            > /etc/apt/sources.list.d/llvm-17.list
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            aria2 binutils build-essential bzip2 ccache clang-17 cmake \
+            desktop-file-utils extra-cmake-modules file git gzip \
+            libaio-dev libasound2-dev libcurl4-openssl-dev libdbus-1-dev \
+            libdecor-0-dev libdigest-sha-perl libegl-dev libevdev-dev \
+            libfontconfig-dev libfreetype-dev libfuse2 libgtk-3-dev \
+            libgudev-1.0-dev libharfbuzz-dev libinput-dev libopengl-dev \
+            libopus-dev libpcap-dev libpipewire-0.3-dev libpulse-dev \
+            libssl-dev libudev-dev libva-dev libvulkan-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libx264-dev libxcb1-dev \
+            libxcb-composite0-dev libxcb-cursor-dev libxcb-damage0-dev \
+            libxcb-glx0-dev libxcb-icccm4-dev libxcb-image0-dev \
+            libxcb-keysyms1-dev libxcb-present-dev libxcb-randr0-dev \
+            libxcb-render0-dev libxcb-render-util0-dev libxcb-shape0-dev \
+            libxcb-shm0-dev libxcb-sync-dev libxcb-util-dev \
+            libxcb-xfixes0-dev libxcb-xinput-dev libxcb-xkb-dev \
+            libxext-dev libxkbcommon-x11-dev libxrandr-dev lld-17 llvm-17 \
+            nasm ninja-build patch patchelf perl pkg-config python3 \
+            tar unzip xz-utils zlib1g-dev
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Patch ARM ISA for Tegra X1
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("cmake/BuildParameters.cmake")
+          text = path.read_text()
+          old = 'add_compile_options("-march=armv8.1-a")'
+          new = 'add_compile_options("-march=armv8-a" "-mtune=cortex-a57" "-mno-outline-atomics")'
+
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one ARMv8.1 build flag, found {count}. "
+                  "Upstream probably changed BuildParameters.cmake."
+              )
+
+          path.write_text(text.replace(old, new))
+          PY
+
+          echo "Applied Tegra X1 ISA patch:"
+          grep -n -A3 -B3 'cortex-a57' cmake/BuildParameters.cmake
+
+      - name: Cache bundled dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: switchroot-jammy-arm64-deps-${{ hashFiles('.github/workflows/scripts/linux/build-dependencies-qt.sh', '.github/workflows/scripts/common/*.patch') }}
+
+      - name: Build bundled dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$DEPS_DIR"
+          BUILD_FFMPEG=1 \
+            bash .github/workflows/scripts/linux/build-dependencies-qt.sh "$DEPS_DIR"
+
+      - name: Download game patches database
+        run: |
+          mkdir -p bin/resources
+          aria2c --allow-overwrite=true --auto-file-renaming=false \
+            --dir=bin/resources --out=patches.zip \
+            https://github.com/isztldav/pcsx2_patches/releases/latest/download/patches.zip
+
+      - name: Configure ARMSX2
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
+            -DCMAKE_PREFIX_PATH="$DEPS_DIR" \
+            -DCMAKE_C_COMPILER=clang-17 \
+            -DCMAKE_CXX_COMPILER=clang++-17 \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
+            -DCMAKE_MODULE_LINKER_FLAGS_INIT="-fuse-ld=lld" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SETCAP=OFF \
+            -DUSE_LINKED_FFMPEG=ON \
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
+            -DHOST_PAGE_SIZE=4096 \
+            -DHOST_CACHE_LINE_SIZE=64
+
+      - name: Build ARMSX2
+        run: cmake --build build --parallel 3
+
+      - name: Check generated binary
+        run: |
+          file build/bin/armsx2-qt
+          echo "Build glibc: $(ldd --version | head -n1)"
+          echo "Highest GLIBC symbol required by the main executable:"
+          strings build/bin/armsx2-qt \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' \
+            | sort -Vu \
+            | tail -n1 || true
+
+          echo "Checking the main executable for ARMv8.1 LSE instructions:"
+          if llvm-objdump-17 -d build/bin/armsx2-qt \
+            | grep -E -m20 '\b(ldadd|ldclr|ldeor|ldset|swp|cas[a-z]*)\b'; then
+            echo "WARNING: LSE-looking instructions were found. Review the output above."
+          else
+            echo "No obvious LSE instructions found in the main executable."
+          fi
+
+      - name: Package AppImage
+        env:
+          NAME: ARMSX2-switchroot-tegra-x1-arm64
+        run: |
+          bash .github/workflows/scripts/linux/appimage-qt.sh \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/build" \
+            "$DEPS_DIR" \
+            "$NAME"
+          chmod +x "$NAME.AppImage"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-switchroot-tegra-x1-arm64
+          path: ARMSX2-switchroot-tegra-x1-arm64.AppImage
+          if-no-files-found: error
