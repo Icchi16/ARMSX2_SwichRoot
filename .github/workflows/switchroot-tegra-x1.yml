@@ -1,4 +1,4 @@
-name: Build ARMSX2 for Switchroot Tegra X1 v4
+name: Build ARMSX2 for Switchroot Tegra X1 v5
 
 on:
   workflow_dispatch:
@@ -293,11 +293,25 @@ jobs:
             exit 1
           fi
 
+      - name: Trust GitHub workspace for AppImage version metadata
+        run: |
+          set -euxo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$(pwd)"
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD
+          git -C "$GITHUB_WORKSPACE" status --short
+
       - name: Package AppImage
         env:
           NAME: ARMSX2-switchroot-tegra-x1-arm64
         run: |
           set -euxo pipefail
+          # actions/checkout temporarily changes HOME while configuring Git.
+          # Reapply the trust entry in the real container HOME because the
+          # upstream AppImage script calls git repeatedly for version metadata.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD
+
           export PATH="$DEPS_DIR/bin:$PATH"
           export PKG_CONFIG_PATH="$DEPS_DIR/lib/pkgconfig:$DEPS_DIR/share/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$DEPS_DIR/lib:${LD_LIBRARY_PATH:-}"
@@ -357,7 +371,7 @@ jobs:
       - name: Upload AppImage and build information
         uses: actions/upload-artifact@v4
         with:
-          name: ARMSX2-switchroot-tegra-x1-arm64-v4
+          name: ARMSX2-switchroot-tegra-x1-arm64-v5
           path: |
             ARMSX2-switchroot-tegra-x1-arm64.AppImage
             build-info.txt
